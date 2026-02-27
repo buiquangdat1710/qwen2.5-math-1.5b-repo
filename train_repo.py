@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 import random
 
 # ============================================================
-# Configuration
+# Configuration (updated with REPO-specific parameters)
 # ============================================================
 
 @dataclass
@@ -34,8 +34,13 @@ class REPOConfig:
     group_size: int = field(default=4)
     batch_size: int = field(default=2)
     learning_rate: float = field(default=1e-6)
-    kl_coef: float = field(default=0.1)
-    entropy_coef: float = field(default=0.01)
+    kl_coef: float = field(default=0.1)        # not used in REPO, kept for compatibility
+    entropy_coef: float = field(default=0.01)  # not used in REPO, kept for compatibility
+    
+    # REPO specific
+    ppo_epochs: int = field(default=4)         # number of PPO epochs per batch
+    eps_low: float = field(default=0.2)        # lower clip bound
+    eps_high: float = field(default=0.2)       # upper clip bound
     
     # Dataset settings
     num_train_samples: int = field(default=400)
@@ -51,7 +56,7 @@ class REPOConfig:
     eval_batch_size: int = field(default=8)
 
 # ============================================================
-# Helper Functions (Identical to your evaluation code)
+# Helper Functions (identical to your evaluation code)
 # ============================================================
 
 def extract_answer(text):
@@ -149,7 +154,7 @@ class SimpleRewardModel:
         return reward
 
 class REPOTrainer:
-    """Group Relative Policy Optimization Trainer"""
+    """Group Relative Policy Optimization Trainer with REPO objective"""
     def __init__(self, model, tokenizer, config: REPOConfig):
         self.model = model
         self.tokenizer = tokenizer
@@ -165,15 +170,13 @@ class REPOTrainer:
             lr=config.learning_rate,
             weight_decay=0.01
         )
-        
-        # Reference model for KL divergence
-        self.ref_model = None  # Will be initialized when needed
     
-    def _generate_response(self, prompt: str) -> Tuple[str, float]:
-        """Generate a single response and compute its log probability"""
+    def _generate_response(self, prompt: str) -> Dict:
+        """Generate a single response and return token-level data"""
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        input_len = inputs.input_ids.shape[1]
+        prompt_ids = inputs.input_ids[0].tolist()
         
-        # Generate with sampling
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
@@ -186,21 +189,24 @@ class REPOTrainer:
                 pad_token_id=self.tokenizer.pad_token_id
             )
         
-        # Decode response
-        generated_ids = outputs.sequences[0, inputs.input_ids.shape[1]:]
+        generated_ids = outputs.sequences[0, input_len:]
         response = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
         
-        # Compute average log probability
+        # Compute log probs for each generated token (old policy)
         log_probs = []
         for i, token_id in enumerate(generated_ids):
-            logits = outputs.scores[i]
+            logits = outputs.scores[i]                     # shape (1, vocab_size)
             log_prob = F.log_softmax(logits, dim=-1)
             token_log_prob = log_prob[0, token_id].item()
             log_probs.append(token_log_prob)
         
-        avg_log_prob = np.mean(log_probs) if log_probs else 0.0
-        
-        return response, avg_log_prob
+        return {
+            "response": response,
+            "prompt_ids": prompt_ids,
+            "token_ids": generated_ids.tolist(),
+            "log_probs": log_probs,
+            "full_text": prompt + response
+        }
     
     def generate_group(self, prompt: str, num_samples: int) -> List[Dict]:
         """Generate a group of responses for a single prompt"""
@@ -225,39 +231,32 @@ Solution:
 """
         
         for _ in range(num_samples):
-            response, log_prob = self._generate_response(formatted_prompt)
-            group.append({
-                "response": response,
-                "log_prob": log_prob,
-                "full_text": formatted_prompt + response
-            })
+            response_data = self._generate_response(formatted_prompt)
+            group.append(response_data)
         
         return group
     
     def compute_advantages(self, rewards: List[float]) -> List[float]:
-        """Compute advantages using group relative ranking"""
+        """Compute advantages based on ranks (REPO style)"""
         if len(rewards) < 2:
             return [0.0] * len(rewards)
         
-        # Convert to numpy array
-        rewards_array = np.array(rewards)
+        # Convert rewards to ranks (1 = highest reward)
+        sorted_indices = np.argsort(rewards)[::-1]  # descending
+        ranks = np.zeros(len(rewards))
+        for rank, idx in enumerate(sorted_indices):
+            ranks[idx] = rank + 1  # rank 1 is best
         
-        # Normalize rewards
-        mean_reward = rewards_array.mean()
-        std_reward = rewards_array.std() + 1e-8
-        normalized_rewards = (rewards_array - mean_reward) / std_reward
-        
-        # Softmax to get probabilities
-        exp_rewards = np.exp(normalized_rewards)
-        probs = exp_rewards / exp_rewards.sum()
-        
-        # Advantages are centered probabilities
-        advantages = probs - probs.mean()
-        
-        return advantages.tolist()
+        # Normalize ranks to [-1, 1]
+        G = len(rewards)
+        if G > 1:
+            centered = (ranks - (G + 1) / 2) / ((G - 1) / 2)
+        else:
+            centered = 0.0
+        return centered.tolist()
     
     def train_iteration(self, prompts: List[str], gold_answers: List[str] = None):
-        """Perform one REPO training iteration"""
+        """Perform one REPO training iteration (with multiple PPO epochs)"""
         self.model.train()
         total_loss = 0
         num_batches = 0
@@ -269,55 +268,97 @@ Solution:
         for batch_start in range(0, len(prompts), self.config.batch_size):
             batch_indices = indices[batch_start:batch_start + self.config.batch_size]
             batch_prompts = [prompts[i] for i in batch_indices]
-            
             if gold_answers:
                 batch_gold_answers = [gold_answers[i] for i in batch_indices]
             else:
                 batch_gold_answers = [None] * len(batch_prompts)
             
-            # Process each prompt in batch
+            # Step 1: Generate groups and compute advantages (using current model as π_old)
+            group_data = []  # list of dicts per prompt
             for prompt, gold_answer in zip(batch_prompts, batch_gold_answers):
-                # Generate group of responses
+                # Generate group
                 group = self.generate_group(prompt, self.config.group_size)
-                
                 # Compute rewards
-                group_rewards = []
-                for response_data in group:
-                    reward = self.reward_model.compute_reward(
-                        prompt,
-                        response_data["response"],
-                        gold_answer
-                    )
-                    group_rewards.append(reward)
+                rewards = []
+                for resp in group:
+                    reward = self.reward_model.compute_reward(prompt, resp["response"], gold_answer)
+                    rewards.append(reward)
+                # Compute rank-based advantages
+                advantages = self.compute_advantages(rewards)
+                group_data.append({
+                    "prompt": prompt,
+                    "responses": group,
+                    "advantages": advantages,
+                    "rewards": rewards
+                })
+            
+            # Step 2: Multiple PPO epochs on the same batch
+            for epoch in range(self.config.ppo_epochs):
+                epoch_loss = 0.0
                 
-                # Compute advantages
-                advantages = self.compute_advantages(group_rewards)
+                for data in group_data:
+                    responses = data["responses"]
+                    advantages = data["advantages"]
+                    
+                    group_token_losses = []
+                    group_token_counts = []
+                    
+                    for i, resp_data in enumerate(responses):
+                        adv = advantages[i]
+                        old_log_probs = torch.tensor(resp_data["log_probs"], device=self.device)
+                        token_ids = resp_data["token_ids"]
+                        prompt_ids = resp_data["prompt_ids"]
+                        
+                        if len(token_ids) == 0:
+                            # Skip empty responses
+                            continue
+                        
+                        # Reconstruct full input ids
+                        full_input_ids = torch.tensor([prompt_ids + token_ids], device=self.device)
+                        
+                        # Forward pass with current model to get logits
+                        outputs = self.model(full_input_ids)
+                        logits = outputs.logits  # (1, seq_len, vocab_size)
+                        
+                        # Get logits for the generated tokens only (last len(token_ids) positions)
+                        gen_logits = logits[0, -len(token_ids):, :]  # (len, vocab_size)
+                        # Compute log probs
+                        log_probs = F.log_softmax(gen_logits, dim=-1)
+                        # Gather the log probs for the actual tokens
+                        token_tensor = torch.tensor(token_ids, device=self.device)
+                        current_log_probs = log_probs[range(len(token_ids)), token_tensor]
+                        
+                        # Compute importance ratio
+                        ratio = torch.exp(current_log_probs - old_log_probs)
+                        
+                        # Clipped ratio
+                        clipped_ratio = torch.clamp(ratio, 1 - self.config.eps_low, 1 + self.config.eps_high)
+                        
+                        # Loss per token: min(ratio * adv, clipped_ratio * adv)
+                        loss_per_token = torch.min(ratio * adv, clipped_ratio * adv)
+                        
+                        group_token_losses.append(loss_per_token.sum())
+                        group_token_counts.append(len(token_ids))
+                    
+                    # Normalize by total tokens in this group
+                    if group_token_counts:
+                        group_total_loss = torch.stack(group_token_losses).sum()
+                        group_total_tokens = sum(group_token_counts)
+                        group_loss = group_total_loss / group_total_tokens
+                        epoch_loss += group_loss
                 
-                # Convert to tensors
-                advantages_tensor = torch.tensor(advantages, device=self.device).requires_grad_(False)
-                log_probs_tensor = torch.tensor(
-                    [r["log_prob"] for r in group],
-                    device=self.device
-                ).requires_grad_(True)
-                
-                # Policy gradient loss
-                pg_loss = -(advantages_tensor * log_probs_tensor).mean()
-                
-                # Add entropy regularization
-                probs = torch.exp(log_probs_tensor)
-                entropy = -(probs * log_probs_tensor).sum(-1).mean()
-                
-                # Total loss
-                loss = pg_loss - self.config.entropy_coef * entropy
-                
-                # Backward pass
-                self.optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.optimizer.step()
-                
-                total_loss += loss.item()
-                num_batches += 1
+                # Average loss over groups in batch
+                if len(group_data) > 0:
+                    batch_loss = epoch_loss / len(group_data)
+                    
+                    # Backward pass
+                    self.optimizer.zero_grad()
+                    batch_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    self.optimizer.step()
+                    
+                    total_loss += batch_loss.item()
+                    num_batches += 1
         
         return total_loss / max(num_batches, 1)
     
@@ -331,6 +372,8 @@ Solution:
         print(f"   Training samples: {len(train_prompts)}")
         print(f"   Group size: {self.config.group_size}")
         print(f"   Batch size: {self.config.batch_size}")
+        print(f"   PPO epochs: {self.config.ppo_epochs}")
+        print(f"   Epsilon low/high: {self.config.eps_low}/{self.config.eps_high}")
         
         for iteration in range(num_iterations):
             avg_loss = self.train_iteration(train_prompts, train_answers)
@@ -377,7 +420,7 @@ Solution:
                 self.model.train()
 
 # ============================================================
-# Training Pipeline
+# Training Pipeline (unchanged except config update)
 # ============================================================
 
 def prepare_training_data():
@@ -405,7 +448,7 @@ def train_REPO(config: REPOConfig):
     print("🤖 Loading base model...")
     model = AutoModelForCausalLM.from_pretrained(
         config.base_model_name,
-        torch_dtype=torch.float16,  # Use float16 instead of bfloat16 for compatibility
+        torch_dtype=torch.float16,
         device_map="auto"
     )
     
@@ -440,7 +483,7 @@ def train_REPO(config: REPOConfig):
     return model, tokenizer, full_dataset
 
 # ============================================================
-# Evaluation Function (Identical to your code)
+# Evaluation Function (unchanged)
 # ============================================================
 
 def evaluate_model(model, tokenizer, config: REPOConfig):
@@ -547,29 +590,32 @@ Solution:
     return acc, results
 
 # ============================================================
-# Full Pipeline
+# Full Pipeline (updated with new config)
 # ============================================================
 
 def run_REPO_pipeline():
     """Complete REPO training and evaluation pipeline"""
     
-    # Configuration
+    # Configuration with REPO parameters
     config = REPOConfig(
         base_model_name="Qwen/Qwen2.5-Math-1.5B-Instruct",
         hf_username="your-username",
         push_to_hub=False,
         
         # Training settings
-        num_iterations=3,  # Reduced for faster training
+        num_iterations=3,
         group_size=4,
         batch_size=2,
         learning_rate=1e-6,
-        kl_coef=0.1,
-        entropy_coef=0.01,
+        
+        # REPO specific
+        ppo_epochs=4,
+        eps_low=0.2,
+        eps_high=0.2,
         
         # Dataset settings
-        num_train_samples=100,  # Use 100 samples for training
-        num_eval_samples=0,  # Not used since we train on all data
+        num_train_samples=100,
+        num_eval_samples=0,
         
         # Evaluation settings
         eval_batch_size=8
@@ -579,6 +625,8 @@ def run_REPO_pipeline():
     print(f"Base Model: {config.base_model_name}")
     print(f"Training Samples: {config.num_train_samples}")
     print(f"REPO Iterations: {config.num_iterations}")
+    print(f"PPO Epochs: {config.ppo_epochs}")
+    print(f"Epsilon: low={config.eps_low}, high={config.eps_high}")
     print("\n" + "="*60)
     
     # Set seed for reproducibility
@@ -619,7 +667,10 @@ def run_REPO_pipeline():
                 "group_size": config.group_size,
                 "batch_size": config.batch_size,
                 "learning_rate": config.learning_rate,
-                "num_train_samples": config.num_train_samples
+                "num_train_samples": config.num_train_samples,
+                "ppo_epochs": config.ppo_epochs,
+                "eps_low": config.eps_low,
+                "eps_high": config.eps_high
             },
             "results": {
                 "base_accuracy": base_acc,
@@ -658,7 +709,7 @@ def run_REPO_pipeline():
         return None, None, None
 
 # ============================================================
-# Quick Test
+# Quick Test (updated with new config)
 # ============================================================
 
 def run_quick_test():
@@ -668,11 +719,14 @@ def run_quick_test():
     # Configuration for quick test
     config = REPOConfig(
         base_model_name="Qwen/Qwen2.5-Math-1.5B-Instruct",
-        num_iterations=1,           # Just 1 iteration
-        group_size=2,               # Small group
-        batch_size=1,               # Small batch
-        num_train_samples=20,       # Very few samples
-        learning_rate=2e-6,         # Higher learning rate
+        num_iterations=1,
+        group_size=2,
+        batch_size=1,
+        num_train_samples=20,
+        learning_rate=2e-6,
+        ppo_epochs=2,
+        eps_low=0.2,
+        eps_high=0.2,
         eval_batch_size=4
     )
     
@@ -751,7 +805,7 @@ Solution:
     return model, tokenizer, accuracy
 
 # ============================================================
-# Main
+# Main (updated to include new config)
 # ============================================================
 
 if __name__ == "__main__":
@@ -769,7 +823,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     if args.mode == "full":
-        # Update config with command line args
         config = REPOConfig(
             num_train_samples=args.train_samples,
             num_iterations=args.iterations
@@ -780,7 +833,6 @@ if __name__ == "__main__":
         run_quick_test()
     
     elif args.mode == "evaluate-only":
-        # Just evaluate the base model
         config = REPOConfig()
         model = AutoModelForCausalLM.from_pretrained(
             config.base_model_name,
