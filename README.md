@@ -2,19 +2,20 @@
 
 **Rank-Enhanced Preference Optimization for Mathematical Reasoning**
 
-[![Hugging Face Model](https://img.shields.io/badge/🤗-Model-blue)](https://huggingface.co/your-username/qwen2.5-math-1.5b-repo)
-[![Paper](https://img.shields.io/badge/📄-Paper-red)]()
+[![Hugging Face Model](https://img.shields.io/badge/🤗-Model-blue)](https://huggingface.co/Dat1710/qwen2.5-math-1.5b-repo)
 [![License](https://img.shields.io/badge/License-MIT-green)]()
 
 ---
 
 ## Abstract
 
-We introduce **Qwen2.5-Math-1.5B-REPO**, a fine-tuned language model specialized in mathematical reasoning, built upon the Qwen2.5-Math-1.5B-Instruct base. The model is trained using **Rank-Enhanced Preference Optimization (REPO)** , a novel reinforcement learning paradigm that leverages **group-wise ranking advantages** and **token-level clipped importance sampling**. REPO replaces traditional z-score advantage normalization with a **rank-based normalization** (mapping ranks to \([-1, 1]\)) and employs asymmetric clipping (\(\epsilon_{\text{low}}\), \(\epsilon_{\text{high}}\)) for stable policy updates, with loss normalized by the total number of tokens in each group:
+We introduce **Qwen2.5-Math-1.5B-REPO**, a fine-tuned language model specialized in mathematical reasoning, built upon the Qwen2.5-Math-1.5B-Instruct base. The model is trained using **Rank-Enhanced Preference Optimization (REPO)** , a novel reinforcement learning paradigm that leverages **group-wise ranking advantages** and **token-level clipped importance sampling**. REPO replaces traditional z-score advantage normalization with a **rank-based normalization** (mapping ranks to $$\([-1, 1]\)$$) and employs asymmetric clipping ($$\(\epsilon_{\text{low}}\), \(\epsilon_{\text{high}}\)$$) for stable policy updates, with loss normalized by the total number of tokens in each group:
 
+$$
 \[
 J_{\text{REPO}}(\theta) = \mathbb{E}\left[\frac{1}{\sum_{i=1}^G |o_i|}\sum_{i=1}^G\sum_{t=1}^{|o_i|}\min\left(r_{i,t}(\theta)\hat{A}_{i,t},\; \text{clip}(r_{i,t}(\theta),1-\epsilon_{\text{low}},1+\epsilon_{\text{high}})\hat{A}_{i,t}\right)\right]
 \]
+$$
 
 Experimental results on both English and Chinese mathematical benchmarks demonstrate that Qwen2.5-Math-1.5B-REPO achieves **state-of-the-art performance** among 1.5B parameter models, surpassing its instruct counterpart by **+4.4% on MATH**, **+2.8% on MMLU STEM**, and **+2.8% on QA (Chinese)** . Furthermore, with **Tool-Integrated Reasoning (TIR)** the model reaches **84% on MATH**, outperforming both the base instruct model and its COT variant.
 
@@ -131,5 +132,54 @@ The combination of REPO fine-tuning and TIR yields the best results across all c
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-model = AutoModelForCausalLM.from_pretrained("your-username/qwen2.5-math-1.5b-repo")
-tokenizer = AutoTokenizer.from_pretrained("your-username/qwen2.5-math-1.5b-repo")
+model = AutoModelForCausalLM.from_pretrained("Dat1710/qwen2.5-math-1.5b-repo")
+tokenizer = AutoTokenizer.from_pretrained("Dat1710/qwen2.5-math-1.5b-repo")
+prompt = """You are an advanced mathematical reasoning model.
+Solve the following problem step by step, and put your final answer in \\boxed{}.
+
+Problem: A train travels 60 miles per hour for 2 hours. How far does it travel?
+
+Solution:"""
+inputs = tokenizer(prompt, return_tensors="pt")
+outputs = model.generate(**inputs, max_new_tokens=256, temperature=0)
+print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+```
+
+### 5.2. Inference (COT)
+
+```python
+prompt = """You are an advanced mathematical reasoning model.
+Solve the following problem step by step, and put your final answer in \\boxed{}.
+
+Problem: A train travels 60 miles per hour for 2 hours. How far does it travel?
+
+Solution:"""
+inputs = tokenizer(prompt, return_tensors="pt")
+outputs = model.generate(**inputs, max_new_tokens=256, temperature=0)
+print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+```
+
+### 5.3. Inference with TIR (Tool-Integrated Reasoning)
+For TIR, we recommend using the [Qwen Math Demo](https://github.com/QwenLM/Qwen2.5-Math) which provides a Python interpreter integration.
+
+## 6. Training Code
+The REPO training implementation is available in this repository. Key components:
+
+- **REPOConfig:** Configuration dataclass with REPO-specific parameters.
+
+- **REPOTrainer:** Main trainer implementing group generation, rank advantage computation, and token-level PPO updates.
+
+- **SimpleRewardModel:** Rule-based reward function for mathematical responses.
+
+To reproduce the training:
+
+```cmd
+python train_repo.py --mode full --train-samples 100 --iterations 3
+```
+
+## 7. Limitations
+- GaoKao Math Cloze: The REPO model underperforms on this specific cloze task compared to the instruct baseline. This may be due to the reward model not adequately capturing the cloze format requirements.
+
+- Training Data: The model was trained on only 100 examples from MATH-500; performance could potentially improve with more diverse training data.
+
+- Reward Model: The simple rule-based reward may not capture all nuances of mathematical reasoning (e.g., elegance, alternative solution paths).
